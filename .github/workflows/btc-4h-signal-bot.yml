@@ -1,0 +1,36 @@
+name: BTC 4h AI-Score Signal Bot
+
+on:
+  schedule:
+    - cron: "10 0,4,8,12,16,20 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r btc-4h-signal-bot/requirements.txt
+
+      - name: Run signal bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python btc-4h-signal-bot/signal_bot.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "btc-4h-signal-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add btc-4h-signal-bot/state.json
+          git diff --quiet --cached || git commit -m "Update bot state [skip ci]"
+          git push
