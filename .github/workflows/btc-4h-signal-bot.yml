@@ -2,15 +2,33 @@ name: BTC 4h AI-Score Signal Bot
 
 on:
   schedule:
-    - cron: "10 * * * *"
+    # Die 4h-Kerzen schliessen um 00/04/08/12/16/20 UTC.
+    #
+    # GitHub fuehrt geplante Workflows nur "best effort" aus und laesst in
+    # privaten Repos regelmaessig Laeufe komplett ausfallen (gemessen: statt
+    # 24 Laeufen/Tag kamen nur 3-6 an, mit bis zu 4h Verspaetung). Ein
+    # gleichmaessig ueber den Tag verteilter Cron verschenkt daher fast alle
+    # Versuche in Zeitfenstern, in denen ohnehin keine Kerze schliesst.
+    #
+    # Deshalb: mehrere Versuche direkt NACH jedem Kerzenschluss. Zusaetzliche
+    # Laeufe kosten nichts, weil der Bot ueber state.json idempotent ist und
+    # ohne neue Kerze nach ~15 Sekunden ohne Nachricht endet.
+    - cron: "2,9,17,28,42 0,4,8,12,16,20 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
+# Verhindert, dass zwei dicht aufeinanderfolgende Versuche gleichzeitig
+# state.json schreiben und sich beim Push in die Quere kommen.
+concurrency:
+  group: btc-4h-signal-bot
+  cancel-in-progress: false
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -32,5 +50,19 @@ jobs:
           git config user.name "btc-4h-signal-bot"
           git config user.email "actions@users.noreply.github.com"
           git add btc-4h-signal-bot/state.json
-          git diff --quiet --cached || git commit -m "Update bot state [skip ci]"
-          git push
+          if git diff --quiet --cached; then
+            echo "State unchanged, nothing to commit."
+            exit 0
+          fi
+          git commit -m "Update bot state [skip ci]"
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "State pushed (attempt $attempt)."
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt), syncing with remote..."
+            git pull --rebase --autostash || git rebase --abort || true
+            sleep 3
+          done
+          echo "::warning::Could not push updated state after 3 attempts."
+          exit 0
