@@ -12,8 +12,16 @@ and tracks a lightweight paper position in state.json so it knows whether
 it's "in a trade" across runs (GitHub Actions runners are stateless --
 state.json is committed back to the repo after each run).
 
+IMPORTANT: GitHub's scheduler is unreliable and frequently fires this
+workflow only every 4-6 hours instead of on the configured cron. Because
+4h candles close every 4 hours, a run can easily skip one or more candles.
+The bot therefore replays EVERY candle that closed since the last processed
+one, instead of only looking at the newest candle -- otherwise signals that
+occurred on a skipped candle would be silently lost.
+
 This sends notifications only. It never places real orders.
 """
+import datetime as dt
 import json
 import os
 import sys
@@ -23,6 +31,12 @@ import urllib.error
 
 import numpy as np
 import pandas as pd
+
+try:
+    from zoneinfo import ZoneInfo
+    BERLIN = ZoneInfo("Europe/Berlin")
+except Exception:
+    BERLIN = None
 
 # ---------------------------------------------------------------------------
 # Parameters -- must match btc-4h-ai-score-indicator.pine's tuned defaults
@@ -47,6 +61,11 @@ ATR_STOP_MULT = 4.0
 TP1_R, TP2_R = 1.5, 3.0
 CHANDELIER_LEN, CHANDELIER_MULT = 22, 3.0
 COOLDOWN_BARS = 8
+
+# Replay at most this many missed candles (2 days). Anything older than that
+# is replayed silently to rebuild the position state without spamming old
+# notifications.
+MAX_REPLAY_BARS = 12
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 
@@ -127,14 +146,18 @@ def compute_indicators(df):
     df["chand_high"] = df["high"].rolling(CHANDELIER_LEN).max() - CHANDELIER_MULT * df["atr"]
     df["chand_low"] = df["low"].rolling(CHANDELIER_LEN).min() + CHANDELIER_MULT * df["atr"]
 
+    # NOTE: the individual components must NOT be clipped to [-1, 1]. The Pine
+    # indicator and the validated backtest engine both use the raw values --
+    # clipping (as the original Gold-bot template did) produces a materially
+    # different score and therefore a different, unvalidated signal set.
     trend_weight = ((df["adx"] - ADX_FLOOR) / (ADX_CEIL - ADX_FLOOR)).clip(0, 1)
     mr_weight = 1 - trend_weight
-    ema_score = ((df["ema_fast"] - df["ema_slow"]) / df["atr"]).clip(-1, 1)
-    macd_score = (df["macd_hist"] / df["atr"]).clip(-1, 1)
-    trend_rsi_score = ((df["rsi"] - 50) / 25).clip(-1, 1)
+    ema_score = (df["ema_fast"] - df["ema_slow"]) / df["atr"]
+    macd_score = df["macd_hist"] / df["atr"]
+    trend_rsi_score = (df["rsi"] - 50) / 25
     trend_score = (ema_score + macd_score + trend_rsi_score) / 3
-    bb_score = ((df["basis"] - df["close"]) / (BB_MULT * df["stddev"])).clip(-1, 1)
-    mr_rsi_score = ((50 - df["rsi"]) / 25).clip(-1, 1)
+    bb_score = (df["basis"] - df["close"]) / (BB_MULT * df["stddev"])
+    mr_rsi_score = (50 - df["rsi"]) / 25
     mr_score = (bb_score + mr_rsi_score) / 2
     vol_boost = np.where(df["volume"] > df["vol_sma"], 0.1, -0.05)
     df["score"] = trend_weight * trend_score + mr_weight * mr_score + vol_boost
@@ -165,6 +188,7 @@ def send_telegram(text):
     if not token or not chat_id:
         print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set -- skipping send, printing instead:")
         print(text)
+        print("-" * 60)
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = json.dumps({"chat_id": chat_id, "text": text}).encode()
@@ -180,6 +204,108 @@ def fmt(x):
     return f"{x:.2f}"
 
 
+def _local(d):
+    return d.astimezone(BERLIN) if BERLIN is not None else d
+
+
+def candle_footer(ts_ms):
+    """Which candle this event belongs to + when the message actually went out,
+    so any scheduler delay is visible instead of confusing."""
+    closed = dt.datetime.fromtimestamp((ts_ms + BAR_MS) / 1000, dt.timezone.utc)
+    now = dt.datetime.now(dt.timezone.utc)
+    delay_min = int((now - closed).total_seconds() // 60)
+    line = "\n\nKerze geschlossen: " + _local(closed).strftime("%d.%m.%Y %H:%M")
+    line += "\nNachricht gesendet: " + _local(now).strftime("%d.%m.%Y %H:%M")
+    if delay_min >= 5:
+        h, m = divmod(delay_min, 60)
+        line += f"  (Verzoegerung: {h}h {m}min)" if h else f"  (Verzoegerung: {m}min)"
+    return line
+
+
+def step(state, prev, cur, out):
+    """Apply exactly one closed candle to the paper position. Mirrors the
+    per-bar logic of btc-4h-ai-score-indicator.pine. Appends (title, body)
+    tuples to `out` for every event that should be notified."""
+    ts = int(cur["ts"])
+    state["bars_since_sl"] = min(state["bars_since_sl"] + 1, 999999)
+
+    if state["side"] is not None:
+        side = state["side"]
+        if side == "long":
+            if not state["tp1_filled"] and cur["high"] >= state["tp1"]:
+                state["tp1_filled"] = True
+                state["sl"] = state["entry"]
+                out.append((ts,
+                            f"BTC AI-Score (4h): TP1 erreicht (Long)\nTP1: {fmt(state['tp1'])}\n"
+                            f"Stop jetzt auf Einstieg (Break-even): {fmt(state['sl'])}"))
+            elif state["tp1_filled"] and not state["tp2_filled"] and cur["high"] >= state["tp2"]:
+                state["tp2_filled"] = True
+                out.append((ts,
+                            f"BTC AI-Score (4h): TP2 erreicht (Long)\nTP2: {fmt(state['tp2'])}\n"
+                            f"Rest laeuft mit Trailing-Stop weiter"))
+            elif state["tp2_filled"] and cur["low"] <= cur["chand_low"]:
+                out.append((ts, f"BTC AI-Score (4h): Trailing-Stop ausgeloest (Long)\nExit: {fmt(cur['chand_low'])}"))
+                state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
+                              "tp1_filled": False, "tp2_filled": False})
+                state["bars_since_sl"] = 0
+            elif cur["low"] <= state["sl"]:
+                out.append((ts, f"BTC AI-Score (4h): Stop-Loss ausgeloest (Long)\nExit: {fmt(state['sl'])}"))
+                state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
+                              "tp1_filled": False, "tp2_filled": False})
+                state["bars_since_sl"] = 0
+        else:
+            if not state["tp1_filled"] and cur["low"] <= state["tp1"]:
+                state["tp1_filled"] = True
+                state["sl"] = state["entry"]
+                out.append((ts,
+                            f"BTC AI-Score (4h): TP1 erreicht (Short)\nTP1: {fmt(state['tp1'])}\n"
+                            f"Stop jetzt auf Einstieg (Break-even): {fmt(state['sl'])}"))
+            elif state["tp1_filled"] and not state["tp2_filled"] and cur["low"] <= state["tp2"]:
+                state["tp2_filled"] = True
+                out.append((ts,
+                            f"BTC AI-Score (4h): TP2 erreicht (Short)\nTP2: {fmt(state['tp2'])}\n"
+                            f"Rest laeuft mit Trailing-Stop weiter"))
+            elif state["tp2_filled"] and cur["high"] >= cur["chand_high"]:
+                out.append((ts, f"BTC AI-Score (4h): Trailing-Stop ausgeloest (Short)\nExit: {fmt(cur['chand_high'])}"))
+                state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
+                              "tp1_filled": False, "tp2_filled": False})
+                state["bars_since_sl"] = 0
+            elif cur["high"] >= state["sl"]:
+                out.append((ts, f"BTC AI-Score (4h): Stop-Loss ausgeloest (Short)\nExit: {fmt(state['sl'])}"))
+                state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
+                              "tp1_filled": False, "tp2_filled": False})
+                state["bars_since_sl"] = 0
+
+    if state["side"] is None and state["bars_since_sl"] >= COOLDOWN_BARS:
+        bull_cross = prev["score"] <= ENTRY_THRESHOLD and cur["score"] > ENTRY_THRESHOLD
+        bear_cross = prev["score"] >= -ENTRY_THRESHOLD and cur["score"] < -ENTRY_THRESHOLD
+        close = cur["close"]
+        atr_val = cur["atr"]
+
+        if bull_cross:
+            sl = close - ATR_STOP_MULT * atr_val
+            risk = close - sl
+            tp1 = close + TP1_R * risk
+            tp2 = close + TP2_R * risk
+            state.update({"side": "long", "entry": close, "sl": sl, "tp1": tp1, "tp2": tp2,
+                          "tp1_filled": False, "tp2_filled": False})
+            out.append((ts,
+                        f"LONG SIGNAL - BTC AI-Score (4h)\nEntry: {fmt(close)}\nStop-Loss: {fmt(sl)}\n"
+                        f"TP1 (40%): {fmt(tp1)}\nTP2 (50%): {fmt(tp2)}"))
+        elif bear_cross:
+            sl = close + ATR_STOP_MULT * atr_val
+            risk = sl - close
+            tp1 = close - TP1_R * risk
+            tp2 = close - TP2_R * risk
+            state.update({"side": "short", "entry": close, "sl": sl, "tp1": tp1, "tp2": tp2,
+                          "tp1_filled": False, "tp2_filled": False})
+            out.append((ts,
+                        f"SHORT SIGNAL - BTC AI-Score (4h)\nEntry: {fmt(close)}\nStop-Loss: {fmt(sl)}\n"
+                        f"TP1 (40%): {fmt(tp1)}\nTP2 (50%): {fmt(tp2)}"))
+
+    state["last_processed_ts"] = ts
+
+
 def main():
     df = fetch_candles(limit=300)
     warmup = max(EMA_SLOW_LEN, BB_LEN, ADX_LEN * 2, CHANDELIER_LEN) + 10
@@ -190,97 +316,45 @@ def main():
     df = compute_indicators(df)
     state = load_state()
 
-    last = df.iloc[-1]
-    if last["ts"] <= state["last_processed_ts"]:
+    last_ts = int(df["ts"].iloc[-1])
+    if last_ts <= state["last_processed_ts"]:
         print("No new closed candle since last run, nothing to do.")
         return
 
-    prev = df.iloc[-2]
-    state["bars_since_sl"] = min(state["bars_since_sl"] + 1, 999999)
+    # First run ever: don't replay history, just anchor on the newest candle.
+    if state["last_processed_ts"] == 0:
+        state["last_processed_ts"] = last_ts
+        save_state(state)
+        print(f"First run -- anchored on candle {last_ts}, no notifications sent.")
+        return
 
-    if state["side"] is not None:
-        side = state["side"]
-        if side == "long":
-            if not state["tp1_filled"] and last["high"] >= state["tp1"]:
-                state["tp1_filled"] = True
-                state["sl"] = state["entry"]
-                send_telegram(
-                    f"BTC AI-Score (4h): TP1 erreicht (Long)\nTP1: {fmt(state['tp1'])}\n"
-                    f"Stop jetzt auf Einstieg (Break-even): {fmt(state['sl'])}"
-                )
-            elif state["tp1_filled"] and not state["tp2_filled"] and last["high"] >= state["tp2"]:
-                state["tp2_filled"] = True
-                send_telegram(
-                    f"BTC AI-Score (4h): TP2 erreicht (Long)\nTP2: {fmt(state['tp2'])}\n"
-                    f"Rest laeuft mit Trailing-Stop weiter"
-                )
-            elif state["tp2_filled"] and last["low"] <= last["chand_low"]:
-                send_telegram(f"BTC AI-Score (4h): Trailing-Stop ausgeloest (Long)\nExit: {fmt(last['chand_low'])}")
-                state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
-                               "tp1_filled": False, "tp2_filled": False})
-                state["bars_since_sl"] = 0
-            elif last["low"] <= state["sl"]:
-                send_telegram(f"BTC AI-Score (4h): Stop-Loss ausgeloest (Long)\nExit: {fmt(state['sl'])}")
-                state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
-                               "tp1_filled": False, "tp2_filled": False})
-                state["bars_since_sl"] = 0
-        else:
-            if not state["tp1_filled"] and last["low"] <= state["tp1"]:
-                state["tp1_filled"] = True
-                state["sl"] = state["entry"]
-                send_telegram(
-                    f"BTC AI-Score (4h): TP1 erreicht (Short)\nTP1: {fmt(state['tp1'])}\n"
-                    f"Stop jetzt auf Einstieg (Break-even): {fmt(state['sl'])}"
-                )
-            elif state["tp1_filled"] and not state["tp2_filled"] and last["low"] <= state["tp2"]:
-                state["tp2_filled"] = True
-                send_telegram(
-                    f"BTC AI-Score (4h): TP2 erreicht (Short)\nTP2: {fmt(state['tp2'])}\n"
-                    f"Rest laeuft mit Trailing-Stop weiter"
-                )
-            elif state["tp2_filled"] and last["high"] >= last["chand_high"]:
-                send_telegram(f"BTC AI-Score (4h): Trailing-Stop ausgeloest (Short)\nExit: {fmt(last['chand_high'])}")
-                state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
-                               "tp1_filled": False, "tp2_filled": False})
-                state["bars_since_sl"] = 0
-            elif last["high"] >= state["sl"]:
-                send_telegram(f"BTC AI-Score (4h): Stop-Loss ausgeloest (Short)\nExit: {fmt(state['sl'])}")
-                state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
-                               "tp1_filled": False, "tp2_filled": False})
-                state["bars_since_sl"] = 0
+    # Every candle that closed since the last processed one. GitHub's scheduler
+    # regularly skips runs, so this is normally 1 bar but can be several.
+    pending = df.index[df["ts"] > state["last_processed_ts"]].tolist()
+    pending = [i for i in pending if i >= 1]
+    if not pending:
+        print("Nothing pending.")
+        return
 
-    if state["side"] is None and state["bars_since_sl"] >= COOLDOWN_BARS:
-        bull_cross = prev["score"] <= ENTRY_THRESHOLD and last["score"] > ENTRY_THRESHOLD
-        bear_cross = prev["score"] >= -ENTRY_THRESHOLD and last["score"] < -ENTRY_THRESHOLD
-        close = last["close"]
-        atr_val = last["atr"]
+    if len(pending) > MAX_REPLAY_BARS:
+        skipped = pending[:-MAX_REPLAY_BARS]
+        pending = pending[-MAX_REPLAY_BARS:]
+        print(f"Gap too large -- replaying {len(skipped)} old candles silently.")
+        for i in skipped:
+            step(state, df.iloc[i - 1], df.iloc[i], [])
 
-        if bull_cross:
-            sl = close - ATR_STOP_MULT * atr_val
-            risk = close - sl
-            tp1 = close + TP1_R * risk
-            tp2 = close + TP2_R * risk
-            state.update({"side": "long", "entry": close, "sl": sl, "tp1": tp1, "tp2": tp2,
-                           "tp1_filled": False, "tp2_filled": False})
-            send_telegram(
-                f"LONG SIGNAL - BTC AI-Score (4h)\nEntry: {fmt(close)}\nStop-Loss: {fmt(sl)}\n"
-                f"TP1 (40%): {fmt(tp1)}\nTP2 (50%): {fmt(tp2)}"
-            )
-        elif bear_cross:
-            sl = close + ATR_STOP_MULT * atr_val
-            risk = sl - close
-            tp1 = close - TP1_R * risk
-            tp2 = close - TP2_R * risk
-            state.update({"side": "short", "entry": close, "sl": sl, "tp1": tp1, "tp2": tp2,
-                           "tp1_filled": False, "tp2_filled": False})
-            send_telegram(
-                f"SHORT SIGNAL - BTC AI-Score (4h)\nEntry: {fmt(close)}\nStop-Loss: {fmt(sl)}\n"
-                f"TP1 (40%): {fmt(tp1)}\nTP2 (50%): {fmt(tp2)}"
-            )
+    print(f"Replaying {len(pending)} candle(s): "
+          f"{[int(df['ts'].iloc[i]) for i in pending]}")
 
-    state["last_processed_ts"] = int(last["ts"])
+    events = []
+    for i in pending:
+        step(state, df.iloc[i - 1], df.iloc[i], events)
+
+    for ts, text in events:
+        send_telegram(text + candle_footer(ts))
+
     save_state(state)
-    print("Run complete. State:", state)
+    print(f"Run complete. {len(events)} notification(s). State: {state}")
 
 
 if __name__ == "__main__":
