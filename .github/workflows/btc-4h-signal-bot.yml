@@ -4,16 +4,17 @@ on:
   schedule:
     # Die 4h-Kerzen schliessen um 00/04/08/12/16/20 UTC.
     #
-    # GitHub fuehrt geplante Workflows nur "best effort" aus und laesst in
-    # privaten Repos regelmaessig Laeufe komplett ausfallen (gemessen: statt
-    # 24 Laeufen/Tag kamen nur 3-6 an, mit bis zu 4h Verspaetung). Ein
-    # gleichmaessig ueber den Tag verteilter Cron verschenkt daher fast alle
-    # Versuche in Zeitfenstern, in denen ohnehin keine Kerze schliesst.
+    # GitHub fuehrt geplante Workflows nur "best effort" aus und laesst
+    # regelmaessig Laeufe komplett ausfallen (gemessen im privaten Repo: statt
+    # 24 Laeufen/Tag kamen nur 3-6 an, mit bis zu 4h Verspaetung).
     #
-    # Deshalb: mehrere Versuche direkt NACH jedem Kerzenschluss. Zusaetzliche
-    # Laeufe kosten nichts, weil der Bot ueber state.json idempotent ist und
-    # ohne neue Kerze nach ~15 Sekunden ohne Nachricht endet.
-    - cron: "2,9,17,28,42 0,4,8,12,16,20 * * *"
+    # Dieses Repo ist oeffentlich -> GitHub Actions ist unbegrenzt kostenlos.
+    # Deshalb der dichteste erlaubte Takt (alle 5 Minuten, das ist GitHubs
+    # Minimum-Intervall). Selbst wenn GitHub die Mehrheit der Laeufe verwirft,
+    # kommt kurz nach jedem Kerzenschluss mit hoher Wahrscheinlichkeit einer
+    # durch. Zusaetzliche Laeufe kosten nichts: der Bot ist ueber state.json
+    # idempotent und endet ohne neue Kerze nach ~15 Sekunden ohne Nachricht.
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
