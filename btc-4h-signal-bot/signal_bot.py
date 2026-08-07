@@ -143,8 +143,13 @@ def compute_indicators(df):
     df["stddev"] = df["close"].rolling(BB_LEN).std(ddof=0)
     df["adx"] = adx(df, ADX_LEN)
     df["vol_sma"] = df["volume"].rolling(VOL_LEN).mean()
-    df["chand_high"] = df["high"].rolling(CHANDELIER_LEN).max() - CHANDELIER_MULT * df["atr"]
-    df["chand_low"] = df["low"].rolling(CHANDELIER_LEN).min() + CHANDELIER_MULT * df["atr"]
+    # Chandelier trailing exits, matching the Pine strategy:
+    #   long  exit = highest(high, len) - mult * ATR
+    #   short exit = lowest(low,  len) + mult * ATR
+    # Named explicitly so the two can never be mixed up again.
+    chand_atr = df["atr"]  # BTC-Pine nutzt ATR(atrLen)=ATR(14) auch fuer den Chandelier
+    df["chand_long"] = df["high"].rolling(CHANDELIER_LEN).max() - CHANDELIER_MULT * chand_atr
+    df["chand_short"] = df["low"].rolling(CHANDELIER_LEN).min() + CHANDELIER_MULT * chand_atr
 
     # NOTE: the individual components must NOT be clipped to [-1, 1]. The Pine
     # indicator and the validated backtest engine both use the raw values --
@@ -243,8 +248,8 @@ def step(state, prev, cur, out):
                 out.append((ts,
                             f"BTC AI-Score (4h): TP2 erreicht (Long)\nTP2: {fmt(state['tp2'])}\n"
                             f"Rest laeuft mit Trailing-Stop weiter"))
-            elif state["tp2_filled"] and cur["low"] <= cur["chand_low"]:
-                out.append((ts, f"BTC AI-Score (4h): Trailing-Stop ausgeloest (Long)\nExit: {fmt(cur['chand_low'])}"))
+            elif state["tp2_filled"] and cur["low"] <= cur["chand_long"]:
+                out.append((ts, f"BTC AI-Score (4h): Trailing-Stop ausgeloest (Long)\nExit: {fmt(cur['chand_long'])}"))
                 state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
                               "tp1_filled": False, "tp2_filled": False})
                 state["bars_since_sl"] = 0
@@ -265,8 +270,8 @@ def step(state, prev, cur, out):
                 out.append((ts,
                             f"BTC AI-Score (4h): TP2 erreicht (Short)\nTP2: {fmt(state['tp2'])}\n"
                             f"Rest laeuft mit Trailing-Stop weiter"))
-            elif state["tp2_filled"] and cur["high"] >= cur["chand_high"]:
-                out.append((ts, f"BTC AI-Score (4h): Trailing-Stop ausgeloest (Short)\nExit: {fmt(cur['chand_high'])}"))
+            elif state["tp2_filled"] and cur["high"] >= cur["chand_short"]:
+                out.append((ts, f"BTC AI-Score (4h): Trailing-Stop ausgeloest (Short)\nExit: {fmt(cur['chand_short'])}"))
                 state.update({"side": None, "entry": None, "sl": None, "tp1": None, "tp2": None,
                               "tp1_filled": False, "tp2_filled": False})
                 state["bars_since_sl"] = 0
