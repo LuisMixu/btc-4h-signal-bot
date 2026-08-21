@@ -5,7 +5,7 @@
   "tp1": 74259.54389599894,
   "tp2": 79340.68779199787,
   "tp1_filled": true,
-  "tp2_filled": false,
+  "tp2_filled": true,
   "bars_since_sl": 999999,
-  "last_processed_ts": 1787284800000
+  "last_processed_ts": 1787299200000
 }
