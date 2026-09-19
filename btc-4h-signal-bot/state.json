@@ -1,11 +1,11 @@
 {
-  "side": null,
-  "entry": null,
-  "sl": null,
-  "tp1": null,
-  "tp2": null,
+  "side": "long",
+  "entry": 81330.6,
+  "sl": 77858.0059607987,
+  "tp1": 86539.49105880196,
+  "tp2": 91748.3821176039,
   "tp1_filled": false,
   "tp2_filled": false,
-  "bars_since_sl": 164,
-  "last_processed_ts": 1789819200000
+  "bars_since_sl": 165,
+  "last_processed_ts": 1789833600000
 }
